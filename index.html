@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <title>簡易ゴルフ場マップ</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+  <!-- Leaflet本体 -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+
+  <style>
+    body {
+      margin: 0;
+      font-family: sans-serif;
+    }
+
+    #map {
+      width: 100vw;
+      height: 100vh;
+    }
+
+    .shot-label {
+      background: #2f6fed;
+      color: white;
+      padding: 4px 8px;
+      border-radius: 12px;
+      border: 2px solid white;
+      font-size: 13px;
+      font-weight: bold;
+      box-shadow: 0 1px 5px rgba(0,0,0,0.4);
+    }
+  </style>
+</head>
+<body>
+
+<div id="map"></div>
+
+<script>
+  // 仮のショット地点データ
+  const points = [
+    {
+      name: "1打目 ティー",
+      lat: 35.4255936,
+      lon: 137.3068761,
+      memo: "Driver"
+    },
+    {
+      name: "2打目地点",
+      lat: 35.342170,
+      lon: 137.315050,
+      memo: "7I"
+    },
+    {
+      name: "3打目地点",
+      lat: 35.342930,
+      lon: 137.309488,
+      memo: "AW"
+    }
+  ];
+
+  // 地図の中心
+  const map = L.map("map").setView([points[0].lat, points[0].lon], 17);
+
+  // 背景地図
+  L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+    maxZoom: 21,
+    attribution: "&copy; OpenStreetMap contributors"
+  }).addTo(map);
+
+  const latlngs = [];
+
+  // マーカー表示
+  points.forEach((p, index) => {
+    const latlng = [p.lat, p.lon];
+    latlngs.push(latlng);
+
+    const icon = L.divIcon({
+      className: "",
+      html: `<div class="shot-label">${index + 1}打目</div>`,
+      iconSize: [60, 28],
+      iconAnchor: [20, 14]
+    });
+
+    L.marker(latlng, { icon: icon })
+      .addTo(map)
+      .bindPopup(`<b>${p.name}</b><br>${p.memo}`);
+  });
+
+  // ショット地点を線で結ぶ
+  L.polyline(latlngs, {
+    weight: 4,
+    opacity: 0.8
+  }).addTo(map);
+
+  // 全地点が見えるように調整
+  map.fitBounds(latlngs, {
+    padding: [40, 40]
+  });
+</script>
+
+</body>
+</html>

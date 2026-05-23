@@ -1098,10 +1098,34 @@ function drawMap() {{
     }}
 
     try {{
-        const map = L.map('map').setView([data.center.lat, data.center.lon], 17);
-        L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{
-            maxZoom: 21,
-            attribution: '&copy; OpenStreetMap contributors'
+        // 背景地図は航空写真を初期表示にします。
+        // ゴルフ場では標準地図よりも、フェアウェイ・池・林・グリーン周辺が見やすくなります。
+        const satelliteMap = L.tileLayer(
+            'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{{z}}/{{y}}/{{x}}',
+            {{
+                maxZoom: 19,
+                attribution: 'Tiles &copy; Esri'
+            }}
+        );
+
+        // 航空写真で見づらい場合に備えて、従来の標準地図にも切り替えられるようにします。
+        const standardMap = L.tileLayer(
+            'https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png',
+            {{
+                maxZoom: 21,
+                attribution: '&copy; OpenStreetMap contributors'
+            }}
+        );
+
+        const map = L.map('map', {{
+            center: [data.center.lat, data.center.lon],
+            zoom: 17,
+            layers: [satelliteMap]
+        }});
+
+        L.control.layers({{
+            '航空写真': satelliteMap,
+            '標準地図': standardMap
         }}).addTo(map);
 
         const bounds = [];
