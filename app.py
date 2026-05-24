@@ -1546,6 +1546,82 @@ def total_shot_count(round_data):
     return count
 
 
+def round_sort_key(round_data):
+    """過去ラウンド一覧の並び順に使うキー。
+
+    updated_at があればそれを優先し、なければ created_at / date を使います。
+    文字列の ISO 日時はそのままソートしやすいため、この形式で十分です。
+    """
+    if not isinstance(round_data, dict):
+        return ''
+    return str(
+        round_data.get('updated_at') or
+        round_data.get('created_at') or
+        round_data.get('date') or
+        ''
+    )
+
+
+def round_list_title(round_data):
+    """過去ラウンド一覧に表示する1行目の文字列を作る。"""
+    date = str(round_data.get('date') or '')
+    course_name = str(round_data.get('course_name') or '').strip()
+    if not course_name:
+        course_name = '未設定'
+
+    score = total_score(round_data)
+    shots = total_shot_count(round_data)
+    return '{}  {}  S{} / {}shot'.format(date, course_name, score, shots)
+
+
+def round_list_detail(round_data):
+    """過去ラウンド一覧に表示する2行目の文字列を作る。"""
+    total_par = sum(h.get('par', 4) for h in round_data.get('holes', []))
+    putts = sum(h.get('putts', 0) for h in round_data.get('holes', []))
+    penalty = total_penalty_count(round_data)
+    updated_at = str(round_data.get('updated_at') or '')
+    if len(updated_at) >= 16:
+        updated_at = updated_at[:16].replace('T', ' ')
+    rid = round_id_short(round_data)
+    return 'Par{} / Pt{} / Pe{} / 更新:{} / ID:{}'.format(
+        total_par, putts, penalty, updated_at or '-', rid
+    )
+
+
+def round_operation_message(round_data):
+    """ラウンド選択時の確認メッセージを作る。"""
+    lines = [
+        '日付: {}'.format(round_data.get('date', '')),
+        'ゴルフ場: {}'.format(round_data.get('course_name') or '未設定'),
+        'スコア: {}'.format(total_score(round_data)),
+        'ショット数: {}'.format(total_shot_count(round_data)),
+        'パット数: {}'.format(sum(h.get('putts', 0) for h in round_data.get('holes', []))),
+        'ペナルティ: {}'.format(total_penalty_count(round_data)),
+        'round_id: {}'.format(get_round_id(round_data)),
+    ]
+    return '\n'.join(lines)
+
+
+def round_delete_confirm_message(round_data):
+    """削除前に表示する確認メッセージ。
+
+    削除は golf_data.json から対象ラウンドを取り除く操作です。
+    うっかり削除を避けるため、日付・ゴルフ場・スコアを明示します。
+    """
+    lines = [
+        'このラウンドを削除しますか?',
+        '',
+        '日付: {}'.format(round_data.get('date', '')),
+        'ゴルフ場: {}'.format(round_data.get('course_name') or '未設定'),
+        'スコア: {}'.format(total_score(round_data)),
+        'ショット数: {}'.format(total_shot_count(round_data)),
+        '',
+        '削除すると data/golf_data.json から消えます。',
+        '必要なら backup フォルダのJSONから復元してください。',
+    ]
+    return '\n'.join(lines)
+
+
 def apply_course_pars(round_data, course_item):
     if not isinstance(course_item, dict):
         return False
@@ -2151,6 +2227,141 @@ class ScoreboardView(ui.View):
         return cell
 
     def tableview_did_select(self, tableview, section, row):
+        tableview.selected_row = (-1, -1)
+
+
+
+
+# =============================
+# 過去ラウンド一覧画面
+# =============================
+class RoundHistoryView(ui.View):
+    """保存済みラウンドを一覧表示し、選択したラウンドを開く・分析・削除する画面。
+
+    これまでのアプリは「現在のラウンド」を中心に扱っていました。
+    実用で使うには、過去のテスト記録や本番ラウンドを後から確認できることが重要です。
+    この画面では golf_data.json に保存されている複数ラウンドを round_id で選び直します。
+    """
+    def __init__(self, rounds, on_open_callback=None, on_delete_callback=None, on_analysis_callback=None):
+        super().__init__()
+        self.name = '過去ラウンド'
+        self.background_color = 'white'
+        self.on_open_callback = on_open_callback
+        self.on_delete_callback = on_delete_callback
+        self.on_analysis_callback = on_analysis_callback
+
+        self.rounds = []
+        for round_data in rounds:
+            if isinstance(round_data, dict):
+                self.rounds.append(ensure_round_has_id(clone_round(round_data)))
+
+        # 新しいラウンドほど上に表示します。
+        self.rounds.sort(key=round_sort_key, reverse=True)
+
+        self.make_ui()
+        self.update_count_label()
+
+    def make_ui(self):
+        self.lbl_title = ui.Label()
+        self.lbl_title.text = '保存済みラウンド一覧'
+        self.lbl_title.alignment = ui.ALIGN_CENTER
+        self.lbl_title.font = ('<System-Bold>', 20)
+        self.add_subview(self.lbl_title)
+
+        self.lbl_count = ui.Label()
+        self.lbl_count.alignment = ui.ALIGN_CENTER
+        self.lbl_count.font = ('<System>', 13)
+        self.lbl_count.text_color = 'gray'
+        self.add_subview(self.lbl_count)
+
+        self.lbl_hint = ui.Label()
+        self.lbl_hint.text = 'ラウンドをタップすると「開く・分析・削除」を選べます'
+        self.lbl_hint.alignment = ui.ALIGN_CENTER
+        self.lbl_hint.font = ('<System>', 12)
+        self.lbl_hint.text_color = '#666666'
+        self.add_subview(self.lbl_hint)
+
+        self.tv = ui.TableView()
+        self.tv.data_source = self
+        self.tv.delegate = self
+        self.add_subview(self.tv)
+
+    def layout(self):
+        margin = 12
+        y = 10
+        w = self.width - margin * 2
+
+        self.lbl_title.frame = (margin, y, w, 30)
+        y += 34
+
+        self.lbl_count.frame = (margin, y, w, 24)
+        y += 26
+
+        self.lbl_hint.frame = (margin, y, w, 22)
+        y += 28
+
+        self.tv.frame = (margin, y, w, self.height - y - 10)
+
+    def update_count_label(self):
+        self.lbl_count.text = '{}件のラウンドが保存されています'.format(len(self.rounds))
+
+    def update_list(self):
+        self.rounds.sort(key=round_sort_key, reverse=True)
+        self.update_count_label()
+        self.tv.reload()
+
+    def tableview_number_of_rows(self, tableview, section):
+        return len(self.rounds)
+
+    def tableview_cell_for_row(self, tableview, section, row):
+        round_data = self.rounds[row]
+        cell = ui.TableViewCell('subtitle')
+        cell.text_label.text = round_list_title(round_data)
+        cell.text_label.font = ('<System-Bold>', 15)
+        cell.detail_text_label.text = round_list_detail(round_data)
+        cell.detail_text_label.font = ('<System>', 12)
+        cell.accessory_type = 'disclosure_indicator'
+        return cell
+
+    def tableview_did_select(self, tableview, section, row):
+        if row < 0 or row >= len(self.rounds):
+            return
+
+        round_data = self.rounds[row]
+        rid = get_round_id(round_data)
+
+        choice = console.alert(
+            'ラウンド操作',
+            round_operation_message(round_data),
+            '開く',
+            '分析',
+            '削除',
+            hide_cancel_button=False
+        )
+
+        if choice == 1:
+            if self.on_open_callback:
+                self.on_open_callback(rid)
+            self.close()
+
+        elif choice == 2:
+            if self.on_analysis_callback:
+                self.on_analysis_callback(rid)
+
+        elif choice == 3:
+            confirm = console.alert(
+                '削除確認',
+                round_delete_confirm_message(round_data),
+                '削除する',
+                'やめる',
+                hide_cancel_button=True
+            )
+            if confirm == 1:
+                if self.on_delete_callback:
+                    self.on_delete_callback(rid)
+                self.rounds = [r for r in self.rounds if get_round_id(r) != rid]
+                self.update_list()
+
         tableview.selected_row = (-1, -1)
 
 
@@ -2855,6 +3066,11 @@ class GolfDirectionApp(TappableView):
         style_button(self.btn_round_map, kind='primary')
         self.content.add_subview(self.btn_round_map)
 
+        self.btn_history = ui.Button(title='過去ラウンド')
+        self.btn_history.action = self.open_round_history
+        style_button(self.btn_history)
+        self.content.add_subview(self.btn_history)
+
         self.lbl_mode = ui.Label()
         self.lbl_mode.font = ('<System>', 14)
         self.lbl_mode.text_color = 'blue'
@@ -2916,6 +3132,9 @@ class GolfDirectionApp(TappableView):
 
         self.btn_analysis.frame = (margin, y, half_w, 36)
         self.btn_round_map.frame = (margin + half_w + gap, y, half_w, 36)
+        y += 44
+
+        self.btn_history.frame = (margin, y, w, 36)
         y += 44
 
         self.lbl_mode.frame = (margin, y, w, 24)
@@ -3068,7 +3287,7 @@ class GolfDirectionApp(TappableView):
         self.last_hole_index = 0
         self.autosave_current_round()
         self.update_hole_list()
-        dialogs.hud_alert('新しいラウンドを開始しました', 'success', 1.0)
+        console.hud_alert('新しいラウンドを開始しました', 'success', 1.0)
 
     def resume_last_hole(self, sender):
         actual_index = self.last_hole_index
@@ -3087,6 +3306,110 @@ class GolfDirectionApp(TappableView):
             actual_index,
             on_save_callback=self.on_child_saved
         )
+        v.present('fullscreen')
+
+
+    def open_round_history(self, sender):
+        """過去ラウンド一覧を開く。
+
+        一覧を開く前に現在ラウンドを保存しておくことで、
+        直前の入力内容が一覧側にも反映されます。
+        """
+        self.autosave_current_round()
+
+        v = RoundHistoryView(
+            self.rounds,
+            on_open_callback=self.open_saved_round_by_id,
+            on_delete_callback=self.delete_saved_round_by_id,
+            on_analysis_callback=self.show_analysis_by_round_id
+        )
+        v.present('fullscreen')
+
+    def load_current_round_ui_state(self):
+        """current_round に保存されている前回位置を画面状態へ反映する。"""
+        ui_state = self.current_round.get('ui_state', {})
+        self.hole_page = ui_state.get('hole_page', 0)
+        self.last_hole_index = ui_state.get('last_hole_index', 0)
+
+        if self.hole_page not in (0, 1):
+            self.hole_page = 0
+        if self.last_hole_index < 0:
+            self.last_hole_index = 0
+        if self.last_hole_index > 17:
+            self.last_hole_index = 17
+
+    def open_saved_round_by_id(self, round_id):
+        """過去ラウンド一覧で選んだラウンドを、現在ラウンドとして開く。"""
+        if not round_id:
+            return
+
+        # まず今開いているラウンドを保存してから切り替えます。
+        self.autosave_current_round()
+
+        index = find_round_index_by_id(self.rounds, round_id)
+        if index is None:
+            console.hud_alert('ラウンドが見つかりません', 'error', 1.2)
+            return
+
+        self.current_round_index = index
+        self.current_round = ensure_round_has_id(clone_round(self.rounds[index]))
+        self.load_current_round_ui_state()
+
+        save_active_round_id(get_round_id(self.current_round))
+        self.update_hole_list()
+        console.hud_alert('選択したラウンドを開きました', 'success', 1.0)
+
+    def delete_saved_round_by_id(self, round_id):
+        """保存済みラウンドを削除する。
+
+        現在開いているラウンドを削除した場合は、残っている最新ラウンドを開きます。
+        残りがなければ新しい空ラウンドを作ります。
+        """
+        index = find_round_index_by_id(self.rounds, round_id)
+        if index is None:
+            console.hud_alert('削除対象が見つかりません', 'error', 1.2)
+            return
+
+        current_id = get_round_id(self.current_round)
+        del self.rounds[index]
+
+        if current_id == round_id:
+            latest_index = find_latest_round_index(self.rounds)
+            if latest_index is not None:
+                self.current_round_index = latest_index
+                self.current_round = ensure_round_has_id(clone_round(self.rounds[latest_index]))
+                self.load_current_round_ui_state()
+                save_active_round_id(get_round_id(self.current_round))
+            else:
+                self.current_round = make_empty_round()
+                self.current_round_index = None
+                self.hole_page = 0
+                self.last_hole_index = 0
+                self.sync_current_round_state()
+
+        save_rounds(self.rounds)
+        self.update_hole_list()
+        console.hud_alert('ラウンドを削除しました', 'success', 1.0)
+
+    def show_analysis_by_round_id(self, round_id):
+        """過去ラウンド一覧から分析だけ確認する。"""
+        index = find_round_index_by_id(self.rounds, round_id)
+        if index is None:
+            console.hud_alert('ラウンドが見つかりません', 'error', 1.2)
+            return
+
+        round_data = ensure_round_has_id(clone_round(self.rounds[index]))
+        text = build_analysis_text(round_data)
+
+        v = ui.View(background_color='white')
+        v.name = '分析結果'
+
+        tv = ui.TextView(frame=v.bounds, flex='WH')
+        tv.editable = False
+        tv.font = ('<System>', 16)
+        tv.text = text
+        v.add_subview(tv)
+
         v.present('fullscreen')
 
     def open_par_setting(self, sender):

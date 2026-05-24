@@ -1,4 +1,21 @@
 # coding: utf-8
+"""
+app_storage.py
+
+Pythonista アプリ用の共通ストレージ補助モジュールです。
+
+役割:
+- アプリの基準フォルダを安定して決める
+- data / export / backup フォルダを作る
+- JSON / CSV を安全に保存・読み込みする
+- JSON保存時にバックアップを作る
+- backupフォルダのファイルが増えすぎないように、最新件数だけ残す
+
+今回の重要な変更:
+- 保存のたびに backup が増え続けないようにしました。
+- 同じJSONファイルごとに、バックアップは最新 BACKUP_KEEP_COUNT 個だけ残します。
+"""
+
 import os
 import json
 import time
@@ -21,6 +38,13 @@ DATA_DIR_NAME = 'data'
 EXPORT_DIR_NAME = 'export'
 BACKUP_DIR_NAME = 'backup'
 
+# バックアップを残す数。
+# 例:
+#   10 なら、golf_data.json のバックアップを最新10個だけ残す。
+#   0 にすると、バックアップ作成後すぐ古いものを整理し、結果的に残りません。
+#   None にすると、削除整理を行いません。
+BACKUP_KEEP_COUNT = 10
+
 MANAGED_FOLDER_NAMES = {
     DATA_DIR_NAME,
     EXPORT_DIR_NAME,
@@ -31,7 +55,7 @@ _APP_FOLDER_CACHE = None
 
 
 # =====================================
-# パス補助
+# パス補助
 # =====================================
 def normalize_path(path):
     return os.path.normpath(os.path.abspath(path))
@@ -55,7 +79,11 @@ def basename(path):
 
 def climb_if_managed_subfolder(path):
     """
-    path が data / export / backup そのものなら親フォルダへ戻す。
+    path が data / export / backup そのものなら親フォルダへ戻す。
+
+    Pythonista では、実行時のカレントフォルダが意図せず
+    data や export になることがあります。
+    その場合、さらに data/data のような入れ子ができるのを防ぎます。
     """
     path = normalize_path(path)
     name = basename(path)
@@ -68,14 +96,15 @@ def climb_if_managed_subfolder(path):
 
 def path_contains_app_py(folder_path):
     """
-    そのフォルダに app.py があるか確認する。
+    そのフォルダに app.py があるか確認する。
+    アプリ本体のあるフォルダを基準フォルダとして優先するために使います。
     """
     return is_existing_file(os.path.join(folder_path, 'app.py'))
 
 
 def make_candidate_from_file(file_path):
     """
-    ファイルパスから親フォルダ候補を作る。
+    ファイルパスから親フォルダ候補を作る。
     """
     if not file_path:
         return None
@@ -92,7 +121,7 @@ def make_candidate_from_file(file_path):
 
 def make_candidate_from_dir(dir_path):
     """
-    ディレクトリパスから候補を作る。
+    ディレクトリパスから候補を作る。
     data / export / backup の中なら親に戻す。
     """
     if not dir_path:
@@ -109,11 +138,12 @@ def make_candidate_from_dir(dir_path):
 
 
 # =====================================
-# アプリ基準フォルダの決定
+# アプリ基準フォルダの決定
 # =====================================
 def resolve_script_folder():
     """
-    このアプリの基準フォルダを安全寄りに取得する。
+    このアプリの基準フォルダを安全寄りに取得する。
+
     優先順位:
       1. __file__
       2. editor.get_path()
@@ -122,7 +152,7 @@ def resolve_script_folder():
 
     さらに、
       - data/export/backup を指した場合は親へ戻す
-      - app.py がある場所を優先する
+      - app.py がある場所を優先する
     """
     candidates = []
 
@@ -154,7 +184,7 @@ def resolve_script_folder():
     except Exception:
         pass
 
-    # app.py がある候補を優先
+    # app.py がある候補を優先
     for candidate in candidates:
         if path_contains_app_py(candidate):
             return candidate
@@ -170,7 +200,7 @@ def resolve_script_folder():
 
 def initialize_app_folder():
     """
-    起動時に1回だけアプリ基準フォルダを確定してキャッシュする。
+    起動時に1回だけアプリ基準フォルダを確定してキャッシュする。
     """
     global _APP_FOLDER_CACHE
 
@@ -184,8 +214,8 @@ def initialize_app_folder():
 
 def app_folder_path():
     """
-    アプリ全体の基準フォルダ。
-    起動後はキャッシュを返すのでブレにくい。
+    アプリ全体の基準フォルダ。
+    起動後はキャッシュを返すのでブレにくい。
     """
     global _APP_FOLDER_CACHE
 
@@ -196,7 +226,7 @@ def app_folder_path():
 
 
 # =====================================
-# サブフォルダ
+# サブフォルダ
 # =====================================
 def ensure_subfolder(name):
     path = os.path.join(app_folder_path(), name)
@@ -245,13 +275,13 @@ def is_path_inside_base(target_path, base_path):
 
 def assert_safe_storage_path(path):
     """
-    保存先が app_folder 配下にあることを確認する。
+    保存先が app_folder 配下にあることを確認する。
     """
     base = app_folder_path()
 
     if not is_path_inside_base(path, base):
         raise RuntimeError(
-            "保存先が想定外です。\n"
+            "保存先が想定外です。\n"
             f"path: {path}\n"
             f"app_folder: {base}"
         )
@@ -262,7 +292,7 @@ def assert_safe_storage_path(path):
 # =====================================
 def stabilize_startup(wait_seconds=STARTUP_WAIT_SECONDS):
     """
-    起動直後の揺れを避けつつ、基準フォルダを先に確定する。
+    起動直後の揺れを避けつつ、基準フォルダを先に確定する。
     """
     try:
         time.sleep(wait_seconds)
@@ -316,7 +346,136 @@ def save_json(file_name, data):
     return path
 
 
+def backup_file_prefix(file_name):
+    """
+    バックアップファイル名の接頭辞を返す。
+
+    例:
+      golf_data.json -> golf_data_
+      golf_courses.json -> golf_courses_
+    """
+    name, _ext = os.path.splitext(file_name)
+    return name + '_'
+
+
+def list_backup_files_for(file_name):
+    """
+    指定されたJSONファイルに対応するバックアップファイル一覧を返す。
+
+    例:
+      file_name = 'golf_data.json'
+      対象:
+        backup/golf_data_20260523_143012.json
+        backup/golf_data_20260523_143245.json
+    """
+    folder = backup_folder_path()
+    prefix = backup_file_prefix(file_name)
+    _name, ext = os.path.splitext(file_name)
+
+    items = []
+
+    try:
+        for fname in os.listdir(folder):
+            if not fname.startswith(prefix):
+                continue
+            if ext and not fname.endswith(ext):
+                continue
+
+            path = os.path.join(folder, fname)
+            path = normalize_path(path)
+
+            if not is_existing_file(path):
+                continue
+
+            try:
+                mtime = os.path.getmtime(path)
+            except Exception:
+                mtime = 0
+
+            items.append({
+                'name': fname,
+                'path': path,
+                'mtime': mtime,
+            })
+    except Exception:
+        return []
+
+    # 新しいものが先
+    items.sort(key=lambda x: (x.get('mtime', 0), x.get('name', '')), reverse=True)
+    return items
+
+
+def cleanup_backups_for(file_name, keep_count=BACKUP_KEEP_COUNT):
+    """
+    指定されたJSONファイルのバックアップを最新 keep_count 個だけ残す。
+
+    注意:
+    - 現在の正式データ data/*.json は削除しません。
+    - backup フォルダ内の古いバックアップだけを削除します。
+    """
+    if keep_count is None:
+        return []
+
+    try:
+        keep_count = int(keep_count)
+    except Exception:
+        keep_count = BACKUP_KEEP_COUNT
+
+    if keep_count < 0:
+        keep_count = 0
+
+    items = list_backup_files_for(file_name)
+
+    # 残す件数以内なら何もしない
+    if len(items) <= keep_count:
+        return []
+
+    delete_items = items[keep_count:]
+    deleted = []
+
+    for item in delete_items:
+        path = item.get('path')
+        try:
+            assert_safe_storage_path(path)
+            os.remove(path)
+            deleted.append(path)
+        except Exception:
+            # バックアップ整理失敗でアプリ本体を止めたくないため、
+            # ここでは例外を外に出しません。
+            pass
+
+    return deleted
+
+
+def cleanup_all_backups(keep_count=BACKUP_KEEP_COUNT):
+    """
+    backup フォルダ内の代表的なJSONバックアップを整理する補助関数。
+
+    通常のアプリ動作では save_json_with_backup() が個別に整理するため、
+    この関数を直接呼ぶ必要はありません。
+
+    既に大量にたまったバックアップを一括整理したい場合に使えます。
+    """
+    target_files = [
+        'golf_data.json',
+        'golf_courses.json',
+        'golf_active_round_id.json',
+    ]
+
+    deleted = []
+    for file_name in target_files:
+        deleted.extend(cleanup_backups_for(file_name, keep_count=keep_count))
+
+    return deleted
+
+
 def backup_json(file_name, data):
+    """
+    現在のJSON内容を backup フォルダに保存する。
+
+    ファイル名例:
+      golf_data_20260523_143012.json
+    """
     timestamp = time.strftime('%Y%m%d_%H%M%S')
     name, ext = os.path.splitext(file_name)
     backup_name = f'{name}_{timestamp}{ext}'
@@ -330,9 +489,17 @@ def backup_json(file_name, data):
 
 
 def save_json_with_backup(file_name, data):
+    """
+    JSONを保存する前に、現在の古いデータを backup に残す。
+
+    今回の改良:
+    - バックアップ作成後、同じ種類のバックアップを最新件数だけ残す。
+    - これにより backup フォルダが増え続けるのを防ぎます。
+    """
     old_data = load_json(file_name, default=None)
     if old_data is not None:
         backup_json(file_name, old_data)
+        cleanup_backups_for(file_name, keep_count=BACKUP_KEEP_COUNT)
 
     return save_json(file_name, data)
 

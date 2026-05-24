@@ -29,6 +29,7 @@
       font-size: 13px;
       font-weight: bold;
       box-shadow: 0 1px 5px rgba(0,0,0,0.4);
+      white-space: nowrap;
     }
   </style>
 </head>
@@ -41,31 +42,54 @@
   const points = [
     {
       name: "1打目 ティー",
-      lat: 35.4255936,
-      lon: 137.3068761,
+      lat: 35.425291,
+      lon: 137.306041,
       memo: "Driver"
     },
     {
       name: "2打目地点",
-      lat: 35.342170,
-      lon: 137.315050,
+      lat: 35.426699,
+      lon: 137.306030,
       memo: "7I"
     },
     {
       name: "3打目地点",
-      lat: 35.342930,
-      lon: 137.309488,
+      lat: 35.427704,
+      lon: 137.305579,
       memo: "AW"
     }
   ];
 
-  // 地図の中心
-  const map = L.map("map").setView([points[0].lat, points[0].lon], 17);
+  // 標準地図
+  const standardMap = L.tileLayer(
+    "https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",
+    {
+      maxZoom: 21,
+      attribution: "&copy; OpenStreetMap contributors"
+    }
+  );
 
-  // 背景地図
-  L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
-    maxZoom: 21,
-    attribution: "&copy; OpenStreetMap contributors"
+  // 航空写真地図
+  const satelliteMap = L.tileLayer(
+    "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+    {
+      maxZoom: 19,
+      attribution: "Tiles &copy; Esri"
+    }
+  );
+
+  // 地図作成
+  // 初期表示は航空写真にする
+  const map = L.map("map", {
+    center: [points[0].lat, points[0].lon],
+    zoom: 17,
+    layers: [satelliteMap]
+  });
+
+  // 右上に背景地図切り替えボタンを追加
+  L.control.layers({
+    "航空写真": satelliteMap,
+    "標準地図": standardMap
   }).addTo(map);
 
   const latlngs = [];
