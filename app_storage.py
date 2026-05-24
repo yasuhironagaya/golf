@@ -40,10 +40,10 @@ BACKUP_DIR_NAME = 'backup'
 
 # バックアップを残す数。
 # 例:
-#   10 なら、golf_data.json のバックアップを最新10個だけ残す。
+#   10 なら、golf_data.json のバックアップを最新5個だけ残す。
 #   0 にすると、バックアップ作成後すぐ古いものを整理し、結果的に残りません。
 #   None にすると、削除整理を行いません。
-BACKUP_KEEP_COUNT = 10
+BACKUP_KEEP_COUNT = 5
 
 MANAGED_FOLDER_NAMES = {
     DATA_DIR_NAME,

@@ -59,6 +59,11 @@ EXPORT_FILE_NAME = 'golf_report.csv'
 # これにより、同じ日に複数ラウンドを作っても「日付だけ」で判定しません。
 ACTIVE_ROUND_ID_FILE_NAME = 'golf_active_round_id.json'
 
+# グリーンオン地点は、スコアに数えないGPS基準点として保存します。
+# パットはGPS OFFで記録する運用にしたため、最後の通常ショットの
+# 飛距離を計算するために、グリーン上のボール位置だけを別点として残します。
+MARKER_TYPE_GREEN_ON = 'green_on'
+
 CLUB_LIST = [
     'Driver', '3W', '5W', 'UT',
     '5I', '6I', '7I', '8I', '9I',
@@ -346,6 +351,8 @@ def export_rounds_csv(rounds):
                     'putts': putts,
                     'penalty_count': penalty,
                     'shot_no': '',
+                    'is_marker': '',
+                    'marker_type': '',
                     'is_putt': '',
                     'club': '',
                     'aim_label': '',
@@ -382,6 +389,8 @@ def export_rounds_csv(rounds):
                         'putts': putts,
                         'penalty_count': penalty,
                         'shot_no': shot.get('shot_no', ''),
+                        'is_marker': shot.get('is_marker', False),
+                        'marker_type': shot.get('marker_type', ''),
                         'is_putt': shot.get('is_putt', False),
                         'club': shot.get('club', ''),
                         'aim_label': aim_label(aim_val),
@@ -406,7 +415,7 @@ def export_rounds_csv(rounds):
     fieldnames = [
         'round_id', 'date', 'course_name',
         'hole_no', 'par', 'score', 'putts', 'penalty_count',
-        'shot_no', 'is_putt', 'club',
+        'shot_no', 'is_marker', 'marker_type', 'is_putt', 'club',
         'aim_label', 'aim_value',
         'actual_label', 'actual_value',
         'diff',
@@ -765,11 +774,31 @@ def distance_yards_between_shots(shot1, shot2):
 
 
 def recalc_shot_distances(hole_data):
-    """同一ホール内で、各ショット地点から次ショット地点までの距離を再計算する。"""
+    """同一ホール内で、各ショット地点から次のGPS地点までの距離を再計算する。
+
+    パットはGPS OFFにする運用のため、最後の通常ショットの次地点がなくなりがちです。
+    そこで、グリーンオン地点を補助点として保存できるようにし、
+    通常ショット → グリーンオン地点 の距離も飛距離として計算します。
+    補助点自身には飛距離を表示しません。
+    """
     shots = hole_data.get('shots', [])
     for i, shot in enumerate(shots):
-        if i < len(shots) - 1:
-            shot['distance_to_next_yard'] = distance_yards_between_shots(shot, shots[i + 1])
+        if not isinstance(shot, dict):
+            continue
+
+        if is_marker_item(shot):
+            shot['distance_to_next_yard'] = None
+            continue
+
+        next_point = None
+        for j in range(i + 1, len(shots)):
+            candidate = shots[j]
+            if isinstance(candidate, dict) and has_gps(candidate):
+                next_point = candidate
+                break
+
+        if next_point is not None:
+            shot['distance_to_next_yard'] = distance_yards_between_shots(shot, next_point)
         else:
             shot['distance_to_next_yard'] = None
 
@@ -841,11 +870,20 @@ def update_gps_time_checks(hole_data, short_yards=10.0, long_yards=350.0, elapse
         shot['distance_from_prev_yard'] = None
         shot['gps_warning'] = ''
 
-        if i == 0:
+        # グリーンオン地点は補助点なので、警告対象にはしません。
+        if is_marker_item(shot):
             continue
 
-        prev = shots[i - 1]
-        if not isinstance(prev, dict):
+        # 直前の「GPSを持つ点」を探します。
+        # パットなどGPSなしの記録が間に入っても、距離判定が壊れにくくなります。
+        prev = None
+        for j in range(i - 1, -1, -1):
+            candidate = shots[j]
+            if isinstance(candidate, dict) and has_gps(candidate):
+                prev = candidate
+                break
+
+        if prev is None:
             continue
 
         distance = distance_yards_between_shots(prev, shot)
@@ -859,8 +897,9 @@ def update_gps_time_checks(hole_data, short_yards=10.0, long_yards=350.0, elapse
 
         warnings = []
         prev_is_putt = bool(prev.get('is_putt', False))
+        prev_is_marker = is_marker_item(prev)
 
-        if distance is not None and elapsed is not None and not prev_is_putt:
+        if distance is not None and elapsed is not None and not prev_is_putt and not prev_is_marker:
             if elapsed >= elapsed_seconds and distance < short_yards:
                 warnings.append('前回地点から近すぎます。古いGPSを拾った可能性があります。')
             if distance > long_yards:
@@ -868,7 +907,6 @@ def update_gps_time_checks(hole_data, short_yards=10.0, long_yards=350.0, elapse
 
         if warnings:
             shot['gps_warning'] = ' / '.join(warnings)
-
 
 def elapsed_text(shot):
     elapsed = safe_float(shot.get('elapsed_from_prev_gps_sec'))
@@ -944,12 +982,19 @@ def shot_map_point_text(hole_no, shot):
     gps_text = gps_status_text(shot)
     memo = str(shot.get('memo', '')).strip()
 
-    parts = [
-        '{}H {}打目'.format(hole_no, shot_no),
-        'クラブ: {}'.format(club),
-        shot_result_text(shot),
-        gps_text,
-    ]
+    if is_green_on_marker(shot):
+        parts = [
+            '{}H グリーンオン地点'.format(hole_no),
+            '種別: 距離計算用の補助点',
+            gps_text,
+        ]
+    else:
+        parts = [
+            '{}H {}打目'.format(hole_no, shot_no),
+            'クラブ: {}'.format(club),
+            shot_result_text(shot),
+            gps_text,
+        ]
     if d_text:
         parts.append(d_text)
     e_text = elapsed_text(shot)
@@ -976,11 +1021,13 @@ def collect_hole_map_points(hole_data):
         lon = safe_float(shot.get('longitude'))
         if lat is None or lon is None:
             continue
+        label = 'グリーンオン' if is_green_on_marker(shot) else '{}打目'.format(shot.get('shot_no', ''))
+        title = '{}H {}'.format(hole_no, label)
         points.append({
             'lat': lat,
             'lon': lon,
-            'label': '{}打目'.format(shot.get('shot_no', '')),
-            'title': '{}H {}打目'.format(hole_no, shot.get('shot_no', '')),
+            'label': label,
+            'title': title,
             'popup': shot_map_point_text(hole_no, shot),
         })
     return points
@@ -1303,6 +1350,8 @@ def ensure_round_has_id(round_data):
         for shot in shots:
             if not isinstance(shot, dict):
                 continue
+            shot.setdefault('is_marker', False)
+            shot.setdefault('marker_type', '')
             shot.setdefault('latitude', None)
             shot.setdefault('longitude', None)
             shot.setdefault('gps_accuracy', None)
@@ -1347,6 +1396,24 @@ def actual_label(value):
     return find_label_from_value(ACTUAL_OPTIONS, value)
 
 
+def is_marker_item(shot):
+    """ショット一覧内の補助地点かどうかを判定する。
+
+    現在はグリーンオン地点を想定しています。
+    補助地点は地図・距離計算には使いますが、スコアには数えません。
+    """
+    return bool(shot.get('is_marker'))
+
+
+def is_green_on_marker(shot):
+    return is_marker_item(shot) and shot.get('marker_type') == MARKER_TYPE_GREEN_ON
+
+
+def is_score_shot(shot):
+    """スコアに数える通常の打数かどうか。"""
+    return isinstance(shot, dict) and not is_marker_item(shot)
+
+
 def hole_penalty_count(hole_data):
     try:
         return int(hole_data.get('penalty_count', 0))
@@ -1355,7 +1422,11 @@ def hole_penalty_count(hole_data):
 
 
 def hole_score(hole_data):
-    shot_count = len(hole_data.get('shots', []))
+    # グリーンオン地点などの補助点はスコアに数えません。
+    shot_count = 0
+    for shot in hole_data.get('shots', []):
+        if is_score_shot(shot):
+            shot_count += 1
     penalty = hole_penalty_count(hole_data)
     return shot_count + penalty
 
@@ -1375,6 +1446,11 @@ def total_penalty_count(round_data):
 
 
 def shot_result_text(shot):
+    if is_green_on_marker(shot):
+        return 'グリーンオン地点 | 距離計算用の補助点'
+    if is_marker_item(shot):
+        return '補助地点 | 距離計算用'
+
     club = shot.get('club', '')
     aim = aim_label(shot.get('aim', 0))
     actual = actual_label(shot.get('actual', 0))
@@ -1401,6 +1477,8 @@ def calc_analysis(round_data, putt_mode=None):
 
     for hole in round_data.get('holes', []):
         for shot in hole.get('shots', []):
+            if is_marker_item(shot):
+                continue
             is_putt = shot.get('is_putt', False)
 
             if putt_mode is True and not is_putt:
@@ -1528,21 +1606,43 @@ def build_analysis_text(round_data):
 
 
 def reorder_shot_numbers(hole_data):
+    """ホール内のショット番号を振り直す。
+
+    グリーンオン地点は、GPS距離計算用の補助点です。
+    そのため、ショット番号を進めず、スコアにもパット数にも含めません。
+    """
     shots = hole_data.get('shots', [])
     putts = 0
-    for i, shot in enumerate(shots, start=1):
-        shot['shot_no'] = i
+    shot_no = 1
+    for shot in shots:
+        if not isinstance(shot, dict):
+            continue
+
+        if is_marker_item(shot):
+            shot['shot_no'] = ''
+            shot['is_putt'] = False
+            continue
+
+        shot['shot_no'] = shot_no
+        shot_no += 1
         if shot.get('is_putt'):
             putts += 1
+
     hole_data['putts'] = putts
     recalc_shot_distances(hole_data)
     update_gps_time_checks(hole_data)
 
 
 def total_shot_count(round_data):
+    """スコアに数えるショット数だけを数える。
+
+    グリーンオン地点は距離計算用の補助点なので、ここでは数えません。
+    """
     count = 0
     for hole in round_data.get('holes', []):
-        count += len(hole.get('shots', []))
+        for shot in hole.get('shots', []):
+            if is_score_shot(shot):
+                count += 1
     return count
 
 
@@ -2206,7 +2306,7 @@ class ScoreboardView(ui.View):
         score = hole_score(hole)
         putts = hole.get('putts', 0)
         penalty = hole_penalty_count(hole)
-        shots = len(hole.get('shots', []))
+        shots = sum(1 for s in hole.get('shots', []) if is_score_shot(s))
 
         mark = '★ ' if row == self.current_index else ''
         cell = ui.TableViewCell('subtitle')
@@ -2503,6 +2603,11 @@ class ShotEditView(ui.View):
         style_button(self.btn_hole_map, kind='primary')
         self.add_subview(self.btn_hole_map)
 
+        self.btn_green_on = ui.Button(title='グリーンオン記録')
+        self.btn_green_on.action = self.add_green_on_point
+        style_button(self.btn_green_on)
+        self.add_subview(self.btn_green_on)
+
         self.tv = ui.TableView()
         self.tv.data_source = self
         self.tv.delegate = self
@@ -2554,6 +2659,9 @@ class ShotEditView(ui.View):
         self.btn_scoreboard.frame = (margin, y, btn_w, 40)
         self.btn_hole_map.frame = (margin + btn_w + gap, y, btn_w, 40)
         y += 48
+
+        self.btn_green_on.frame = (margin, y, w, 38)
+        y += 46
 
         self.tv.frame = (margin, y, w, self.height - y - 10)
 
@@ -2776,6 +2884,110 @@ class ShotEditView(ui.View):
         self.update_list()
         console.hud_alert('ペナルティを -1 しました', 'success', 1.0)
 
+    def make_green_on_marker(self):
+        """グリーンオン地点を、スコアに数えない補助点として作る。"""
+        marker = {
+            'shot_no': '',
+            'is_marker': True,
+            'marker_type': MARKER_TYPE_GREEN_ON,
+            'is_putt': False,
+            'club': 'GreenOn',
+            'aim': 0,
+            'actual': 0,
+            'latitude': None,
+            'longitude': None,
+            'gps_accuracy': None,
+            'gps_timestamp': '',
+            'gps_confirmed_at': '',
+            'gps_raw_timestamp': None,
+            'gps_age_sec': None,
+            'gps_sample_count': None,
+            'gps_elapsed_sec': None,
+            'gps_selection_reason': '',
+            'gps_stage': '',
+            'gps_stability_status': '',
+            'gps_stability_distance_m': None,
+            'gps_first_accuracy': None,
+            'gps_second_accuracy': None,
+            'elapsed_from_prev_gps_sec': None,
+            'distance_from_prev_yard': None,
+            'gps_warning': '',
+            'distance_to_next_yard': None,
+            'memo': 'グリーンオン'
+        }
+        return marker
+
+    def set_putt_mode_after_green_on(self):
+        """グリーンオン後は、そのままパット入力へ移りやすい状態にする。"""
+        self.selected_club = 'Putter'
+        self.selected_aim = 0
+        self.selected_actual = 0
+        self.sw_putt.value = True
+        self.sw_gps.value = False
+        self.confirmed_gps_location = None
+        self.tf_memo.text = ''
+        self.edit_index = None
+        self.btn_club.title = 'クラブ / {}'.format(self.selected_club)
+        self.btn_aim.title = '狙い / {}'.format(aim_label(self.selected_aim))
+        self.btn_actual.title = '実際 / {}'.format(actual_label(self.selected_actual))
+        self.lbl_gps_status.text = 'グリーンオン保存。パットはGPS記録OFF'
+        self.update_add_button_title()
+
+    def add_green_on_point(self, sender):
+        """グリーンオン地点を記録する。
+
+        パットをGPS OFFで記録すると、最後のアプローチショットの「次地点」がなくなり、
+        飛距離が計算できなくなります。そこで、グリーンに乗ったボール位置だけを
+        GPS付きの補助点として保存します。この点はスコアには数えません。
+        """
+        loc = self.confirmed_gps_location
+        if not loc:
+            self.lbl_gps_status.text = '地点未確定'
+            console.alert(
+                'グリーンオン記録',
+                '先にグリーン上のボール位置で「現在地確定」を押してください。\n\nその後、この「グリーンオン記録」を押すと、最後の通常ショットの飛距離計算に使えます。',
+                'OK',
+                hide_cancel_button=True
+            )
+            return
+
+        marker = self.make_green_on_marker()
+        marker.update(gps_fields_from_location(loc))
+
+        shots = list(self.hole_data.get('shots', []))
+
+        # 同じホールで既にグリーンオン地点がある場合は、重複登録を避けるため確認します。
+        existing_index = None
+        for i, shot in enumerate(shots):
+            if isinstance(shot, dict) and is_green_on_marker(shot):
+                existing_index = i
+                break
+
+        if existing_index is not None:
+            choice = console.alert(
+                'グリーンオン記録',
+                'このホールには既にグリーンオン地点があります。\n新しい地点で置き換えますか?',
+                '置き換える',
+                'やめる',
+                hide_cancel_button=True
+            )
+            if choice != 1:
+                return
+            shots[existing_index] = marker
+        else:
+            shots.append(marker)
+
+        self.hole_data['shots'] = shots
+        reorder_shot_numbers(self.hole_data)
+
+        if self.on_save_callback:
+            self.on_save_callback(last_hole_index=self.hole_index)
+
+        self.update_list()
+        self.update_score_label()
+        self.set_putt_mode_after_green_on()
+        console.hud_alert('グリーンオン地点を保存しました', 'success', 1.0)
+
     def add_or_update_shot(self, sender):
         is_putt = bool(self.sw_putt.value)
 
@@ -2788,6 +3000,8 @@ class ShotEditView(ui.View):
         if self.edit_index is None:
             shot = {
                 'shot_no': 0,
+                'is_marker': False,
+                'marker_type': '',
                 'is_putt': is_putt,
                 'club': club_name,
                 'aim': self.selected_aim,
@@ -2819,6 +3033,8 @@ class ShotEditView(ui.View):
             else:
                 return
 
+            shot['is_marker'] = False
+            shot['marker_type'] = ''
             shot['is_putt'] = is_putt
             shot['club'] = club_name
             shot['aim'] = self.selected_aim
@@ -2852,15 +3068,17 @@ class ShotEditView(ui.View):
             )
 
             if warning:
-                self.confirmed_gps_location = None
-                self.lbl_gps_status.text = 'GPS要再取得'
-                console.alert(
+                choice = console.alert(
                     'GPS確認',
-                    warning + '\n\nこのショットはまだ保存していません。\n数秒待ってから、もう一度「現在地確定」を押してください。',
-                    'OK',
+                    warning + '\n\nこのショットはまだ保存していません。\nGPSを取り直す場合は「再取得」を選んでください。\n短いショットなど理由がある場合は、このまま保存できます。',
+                    '再取得',
+                    'このまま保存',
                     hide_cancel_button=True
                 )
-                return
+                if choice == 1:
+                    self.confirmed_gps_location = None
+                    self.lbl_gps_status.text = 'GPS要再取得'
+                    return
 
         if self.edit_index is None:
             shots.append(shot)
@@ -2905,10 +3123,13 @@ class ShotEditView(ui.View):
         shot = shots[row]
 
         cell = ui.TableViewCell('subtitle')
-        cell.text_label.text = '{}打目: {}'.format(
-            shot.get('shot_no', 0),
-            shot_result_text(shot)
-        )
+        if is_green_on_marker(shot):
+            cell.text_label.text = 'グリーンオン: {}'.format(shot_result_text(shot))
+        else:
+            cell.text_label.text = '{}打目: {}'.format(
+                shot.get('shot_no', 0),
+                shot_result_text(shot)
+            )
         detail_parts = []
         d_text = distance_text(shot)
         if d_text:
@@ -2935,10 +3156,13 @@ class ShotEditView(ui.View):
             return
 
         shot = shots[row]
-        message = '{}打目\n{}'.format(
-            shot.get('shot_no', 0),
-            shot_result_text(shot)
-        )
+        if is_green_on_marker(shot):
+            message = 'グリーンオン地点\n{}'.format(shot_result_text(shot))
+        else:
+            message = '{}打目\n{}'.format(
+                shot.get('shot_no', 0),
+                shot_result_text(shot)
+            )
 
         d_text = distance_text(shot)
         if d_text:
@@ -2955,19 +3179,30 @@ class ShotEditView(ui.View):
         if memo:
             message += '\nメモ: {}'.format(memo)
 
-        choice = console.alert(
-            'ショット操作',
-            message,
-            '編集',
-            '削除',
-            '閉じる',
-            hide_cancel_button=True
-        )
+        if is_marker_item(shot):
+            choice = console.alert(
+                '補助地点操作',
+                message,
+                '削除',
+                '閉じる',
+                hide_cancel_button=True
+            )
+            if choice == 1:
+                self.delete_shot_at_row(row)
+        else:
+            choice = console.alert(
+                'ショット操作',
+                message,
+                '編集',
+                '削除',
+                '閉じる',
+                hide_cancel_button=True
+            )
 
-        if choice == 1:
-            self.load_shot_to_inputs(shot, row)
-        elif choice == 2:
-            self.delete_shot_at_row(row)
+            if choice == 1:
+                self.load_shot_to_inputs(shot, row)
+            elif choice == 2:
+                self.delete_shot_at_row(row)
 
         tableview.selected_row = (-1, -1)
 
