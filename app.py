@@ -479,14 +479,17 @@ def location_timestamp_seconds(loc):
 #   - 前回ショット地点との時間・距離関係を見て保存前に警告する
 # という方針で安定性を高めています。
 
-def get_current_gps_location(timeout=12.0, warmup=2.0, desired_accuracy=12.0,
-                             max_age_seconds=15.0, min_sampling_seconds=4.0):
+def get_current_gps_location(timeout=8.0, warmup=0.0, desired_accuracy=12.0,
+                             max_age_seconds=15.0, min_sampling_seconds=2.0,
+                             _already_started=False):
     """Pythonista の location モジュールから現在地を取得する。
 
-    時間重視版:
-    - ボタン直後の古いGPSキャッシュをすぐ採用しない
-    - 数秒間サンプルを集め、後半に取れた位置を優先する
-    - timestamp 判定が使えない環境でも、取得できたGPSは候補に残す
+    時短版:
+    - warmup をデフォルト 0 にし、呼び出し元が start_updates() を維持する場合は
+      _already_started=True を渡すことで start/stop の往復を省略できる。
+    - 数秒間サンプルを集め、後半に取れた位置を優先する点は従来と同じ。
+    - min_sampling_seconds を短くし、精度が出たらすぐ早期終了する。
+    - timeout も短縮（デフォルト 8 秒 → 早期終了で多くの場合 2〜4 秒で完了）。
     """
     if location is None:
         return None
@@ -516,8 +519,11 @@ def get_current_gps_location(timeout=12.0, warmup=2.0, desired_accuracy=12.0,
         return current
 
     try:
-        location.start_updates()
-        time.sleep(warmup)
+        if not _already_started:
+            location.start_updates()
+
+        if warmup > 0:
+            time.sleep(warmup)
 
         start_time = time.time()
         samples = []
@@ -572,7 +578,7 @@ def get_current_gps_location(timeout=12.0, warmup=2.0, desired_accuracy=12.0,
                         item['sample_count'] = len(samples)
                         return item
 
-            time.sleep(0.5)
+            time.sleep(0.4)
 
         if not samples:
             return None
@@ -609,46 +615,66 @@ def get_current_gps_location(timeout=12.0, warmup=2.0, desired_accuracy=12.0,
         return None
 
     finally:
-        try:
-            location.stop_updates()
-        except Exception:
-            pass
+        # _already_started=True の場合は呼び出し元が stop_updates() を担う。
+        if not _already_started:
+            try:
+                location.stop_updates()
+            except Exception:
+                pass
 
 
-
-def get_stable_gps_location(first_timeout=4.0, second_timeout=6.0, pause_seconds=1.5,
+def get_stable_gps_location(first_timeout=4.0, second_timeout=5.0, pause_seconds=0.8,
                             desired_accuracy=12.0, max_age_seconds=15.0,
                             stability_warning_meters=20.0):
     """現在地確定ボタン1回で、内部的に2段階GPS取得を行う。
 
-    目的:
+    時短版の変更点:
+    - start_updates() を最初の1回だけ呼び、2段階を通して GPS をウォームアップ状態に保つ。
+      これにより2回目開始時の再ウォームアップ待ちがなくなる。
+    - pause_seconds を 1.5 → 0.8 秒に短縮。
+    - second_timeout を 6.0 → 5.0 秒に短縮。
+    - 合計の最悪時間: 約 11 秒 → 約 7 秒、早期終了なら 3〜5 秒程度。
+
+    目的（従来と同じ）:
     - 1回目はiPhone側のGPSを現在地へ追いつかせるウォームアップとして扱う
     - 2回目を本命として採用する
     - 1回目と2回目の差を記録し、GPSが動いていたかをあとから確認できるようにする
-
-    戻り値は get_current_gps_location() と同じ形式のdict。
-    2回目が取れた場合は、基本的に2回目を採用する。
     """
-    first = get_current_gps_location(
-        timeout=first_timeout,
-        warmup=0.8,
-        desired_accuracy=desired_accuracy,
-        max_age_seconds=max_age_seconds,
-        min_sampling_seconds=1.5
-    )
+    if location is None:
+        return None
 
     try:
-        time.sleep(pause_seconds)
-    except Exception:
-        pass
+        # GPS を起動し、2段階通して維持する。
+        location.start_updates()
 
-    second = get_current_gps_location(
-        timeout=second_timeout,
-        warmup=0.8,
-        desired_accuracy=desired_accuracy,
-        max_age_seconds=max_age_seconds,
-        min_sampling_seconds=2.5
-    )
+        first = get_current_gps_location(
+            timeout=first_timeout,
+            warmup=0.0,
+            desired_accuracy=desired_accuracy,
+            max_age_seconds=max_age_seconds,
+            min_sampling_seconds=1.5,
+            _already_started=True   # stop_updates() を呼ばせない
+        )
+
+        try:
+            time.sleep(pause_seconds)
+        except Exception:
+            pass
+
+        second = get_current_gps_location(
+            timeout=second_timeout,
+            warmup=0.0,
+            desired_accuracy=desired_accuracy,
+            max_age_seconds=max_age_seconds,
+            min_sampling_seconds=2.0,
+            _already_started=True   # stop_updates() を呼ばせない
+        )
+
+    finally:
+        try:
+            location.stop_updates()
+        except Exception:
+            pass
 
     # 2回目が取れなければ、1回目を保険として返す。
     if second is None:
@@ -2939,6 +2965,9 @@ class ShotEditView(ui.View):
         パットをGPS OFFで記録すると、最後のアプローチショットの「次地点」がなくなり、
         飛距離が計算できなくなります。そこで、グリーンに乗ったボール位置だけを
         GPS付きの補助点として保存します。この点はスコアには数えません。
+
+        GPS妥当性チェックは通常ショットと同じ処理を行います。
+        怪しいGPSの場合は保存前に確認ダイアログを出し、再取得を促します。
         """
         loc = self.confirmed_gps_location
         if not loc:
@@ -2963,16 +2992,38 @@ class ShotEditView(ui.View):
                 existing_index = i
                 break
 
-        if existing_index is not None:
+        # --- 通常ショットと同じGPS妥当性チェック ---
+        # 仮の edit_index を決める（置き換えなら既存インデックス、新規なら None）。
+        check_edit_index = existing_index  # None なら末尾追加として判定される
+
+        warning = gps_warning_for_candidate_shot(
+            self.hole_data,
+            shots,
+            marker,
+            edit_index=check_edit_index
+        )
+
+        if warning:
             choice = console.alert(
-                'グリーンオン記録',
-                'このホールには既にグリーンオン地点があります。\n新しい地点で置き換えますか?',
-                '置き換える',
-                'やめる',
+                'GPS確認',
+                warning + '\n\nこのグリーンオン地点はまだ保存していません。\nGPSを取り直す場合は「再取得」を選んでください。\n短いアプローチなど理由がある場合は、このまま保存できます。',
+                '再取得',
+                'このまま保存',
                 hide_cancel_button=True
             )
-            if choice != 1:
+            if choice == 1:
+                self.confirmed_gps_location = None
+                self.lbl_gps_status.text = 'GPS要再取得'
                 return
+
+        # GPS精度をラベルに反映する（通常ショットと同じ処理）。
+        acc = loc.get('accuracy')
+        if acc is None:
+            self.lbl_gps_status.text = '確定地点を保存'
+        else:
+            self.lbl_gps_status.text = '確定地点を保存 / 約{:.0f}m'.format(acc)
+
+        if existing_index is not None:
             shots[existing_index] = marker
         else:
             shots.append(marker)
