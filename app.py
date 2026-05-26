@@ -257,12 +257,24 @@ def load_active_round_id():
 
 
 def save_active_round_id(round_id):
+    """最後に開いていたラウンドIDを保存する。
+
+    このファイルは復帰用の小さな状態ファイルなので、通常のラウンド本体
+    golf_data.json のように毎回バックアップを作らない。
+    これにより backup フォルダが不要に増えにくくなる。
+    """
     if not round_id:
         return
-    app_storage.save_json_with_backup(ACTIVE_ROUND_ID_FILE_NAME, {
+
+    data = {
         'round_id': round_id,
         'updated_at': now_iso()
-    })
+    }
+
+    if hasattr(app_storage, 'save_json'):
+        app_storage.save_json(ACTIVE_ROUND_ID_FILE_NAME, data)
+    else:
+        app_storage.save_json_with_backup(ACTIVE_ROUND_ID_FILE_NAME, data)
 
 
 # =============================
@@ -367,6 +379,11 @@ def export_rounds_csv(rounds):
                     'gps_confirmed_at': '',
                     'gps_sample_count': '',
                     'gps_elapsed_sec': '',
+                    'gps_stage': '',
+                    'gps_stability_status': '',
+                    'gps_stability_distance_m': '',
+                    'gps_first_accuracy': '',
+                    'gps_second_accuracy': '',
                     'elapsed_from_prev_gps_sec': '',
                     'distance_from_prev_yard': '',
                     'gps_warning': '',
@@ -405,6 +422,11 @@ def export_rounds_csv(rounds):
                         'gps_confirmed_at': shot.get('gps_confirmed_at', ''),
                         'gps_sample_count': shot.get('gps_sample_count', ''),
                         'gps_elapsed_sec': shot.get('gps_elapsed_sec', ''),
+                        'gps_stage': shot.get('gps_stage', ''),
+                        'gps_stability_status': shot.get('gps_stability_status', ''),
+                        'gps_stability_distance_m': shot.get('gps_stability_distance_m', ''),
+                        'gps_first_accuracy': shot.get('gps_first_accuracy', ''),
+                        'gps_second_accuracy': shot.get('gps_second_accuracy', ''),
                         'elapsed_from_prev_gps_sec': shot.get('elapsed_from_prev_gps_sec', ''),
                         'distance_from_prev_yard': shot.get('distance_from_prev_yard', ''),
                         'gps_warning': shot.get('gps_warning', ''),
@@ -2731,6 +2753,12 @@ class ShotEditView(ui.View):
 
     def load_shot_to_inputs(self, shot, index):
         self.edit_index = index
+
+        # 編集開始時は、直前に別地点で確定したGPSを必ず破棄する。
+        # GPSを更新したい場合は、編集画面でGPS記録をONにしてから
+        # あらためて「現在地確定」を押す運用にする。
+        self.confirmed_gps_location = None
+
         self.selected_club = shot.get('club', 'Driver')
         self.selected_aim = shot.get('aim', 0)
         self.selected_actual = shot.get('actual', 0)

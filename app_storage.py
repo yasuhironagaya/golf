@@ -2,581 +2,453 @@
 """
 app_storage.py
 
-Pythonista アプリ用の共通ストレージ補助モジュールです。
+Pythonistaアプリ用の保存補助モジュールです。
 
-役割:
-- アプリの基準フォルダを安定して決める
-- data / export / backup フォルダを作る
-- JSON / CSV を安全に保存・読み込みする
-- JSON保存時にバックアップを作る
-- backupフォルダのファイルが増えすぎないように、最新件数だけ残す
+この golf アプリでは、次の3種類のフォルダを使います。
 
-今回の重要な変更:
-- 保存のたびに backup が増え続けないようにしました。
-- 同じJSONファイルごとに、バックアップは最新 BACKUP_KEEP_COUNT 個だけ残します。
+    data   : JSONなど、アプリ本体が使うデータ
+    export : CSVやHTMLなど、あとから確認する出力ファイル
+    backup : JSONを上書き保存する前のバックアップ
+
+基本方針:
+    - app.py と同じフォルダをアプリの基準フォルダにする
+    - data / export / backup は自動作成する
+    - JSON保存は一時ファイル経由で、できるだけ壊れにくくする
+    - golf_active_round_id.json のような小さな状態ファイルは save_json()
+      を使えばバックアップなしで保存できる
+    - golf_data.json のような本体データは save_json_with_backup()
+      を使えば、上書き前に backup へ退避できる
 """
 
 import os
 import json
-import time
 import csv
+import time
+import datetime
+import inspect
+import shutil
 
 try:
     import editor
-except ImportError:
+except Exception:
     editor = None
 
-
-# =====================================
-# 共通設定
-# =====================================
-STARTUP_WAIT_SECONDS = 0.2
-RETRY_COUNT = 5
-RETRY_WAIT_SECONDS = 0.2
 
 DATA_DIR_NAME = 'data'
 EXPORT_DIR_NAME = 'export'
 BACKUP_DIR_NAME = 'backup'
-
-# バックアップを残す数。
-# 例:
-#   10 なら、golf_data.json のバックアップを最新5個だけ残す。
-#   0 にすると、バックアップ作成後すぐ古いものを整理し、結果的に残りません。
-#   None にすると、削除整理を行いません。
-BACKUP_KEEP_COUNT = 5
-
-MANAGED_FOLDER_NAMES = {
-    DATA_DIR_NAME,
-    EXPORT_DIR_NAME,
-    BACKUP_DIR_NAME,
-}
+MANAGED_FOLDER_NAMES = set([DATA_DIR_NAME, EXPORT_DIR_NAME, BACKUP_DIR_NAME])
 
 _APP_FOLDER_CACHE = None
 
 
-# =====================================
-# パス補助
-# =====================================
+# =============================
+# パス関連
+# =============================
 def normalize_path(path):
-    return os.path.normpath(os.path.abspath(path))
+    """~ や相対パスを、比較しやすい絶対パスへそろえる。"""
+    return os.path.abspath(os.path.expanduser(str(path)))
 
 
-def is_existing_dir(path):
-    return bool(path) and os.path.isdir(path)
+def _path_contains_app_py(folder):
+    """指定フォルダに app.py があるかを確認する。"""
+    try:
+        return os.path.isfile(os.path.join(folder, 'app.py'))
+    except Exception:
+        return False
 
 
-def is_existing_file(path):
-    return bool(path) and os.path.isfile(path)
+def _climb_if_managed_subfolder(folder):
+    """現在地が data/export/backup の中なら、親フォルダを基準に戻す。"""
+    folder = normalize_path(folder)
+    base_name = os.path.basename(folder)
+    if base_name in MANAGED_FOLDER_NAMES:
+        return os.path.dirname(folder)
+    return folder
 
 
-def parent_dir(path):
-    return os.path.dirname(normalize_path(path))
+def _caller_app_folder():
+    """app_storage.py を呼び出した側の .py ファイルがあるフォルダを探す。
 
-
-def basename(path):
-    return os.path.basename(normalize_path(path))
-
-
-def climb_if_managed_subfolder(path):
+    app_storage.py を app.py と同じフォルダに置く場合はもちろん、
+    将来 app_storage.py を共通モジュール置き場に置いた場合でも、
+    呼び出し元の app.py 側を基準フォルダにしやすくするための処理です。
     """
-    path が data / export / backup そのものなら親フォルダへ戻す。
-
-    Pythonista では、実行時のカレントフォルダが意図せず
-    data や export になることがあります。
-    その場合、さらに data/data のような入れ子ができるのを防ぎます。
-    """
-    path = normalize_path(path)
-    name = basename(path)
-
-    if name in MANAGED_FOLDER_NAMES:
-        return parent_dir(path)
-
-    return path
-
-
-def path_contains_app_py(folder_path):
-    """
-    そのフォルダに app.py があるか確認する。
-    アプリ本体のあるフォルダを基準フォルダとして優先するために使います。
-    """
-    return is_existing_file(os.path.join(folder_path, 'app.py'))
-
-
-def make_candidate_from_file(file_path):
-    """
-    ファイルパスから親フォルダ候補を作る。
-    """
-    if not file_path:
-        return None
+    try:
+        this_file = normalize_path(__file__)
+    except Exception:
+        this_file = ''
 
     try:
-        file_path = normalize_path(file_path)
-        if is_existing_file(file_path):
-            return parent_dir(file_path)
+        for frame_info in inspect.stack():
+            globals_dict = frame_info.frame.f_globals
+            file_path = globals_dict.get('__file__')
+            if not file_path:
+                continue
+
+            file_path = normalize_path(file_path)
+            if this_file and file_path == this_file:
+                continue
+
+            folder = _climb_if_managed_subfolder(os.path.dirname(file_path))
+            if folder:
+                return folder
     except Exception:
         pass
 
     return None
 
 
-def make_candidate_from_dir(dir_path):
-    """
-    ディレクトリパスから候補を作る。
-    data / export / backup の中なら親に戻す。
-    """
-    if not dir_path:
+def _editor_folder():
+    """Pythonistaのエディタで開いているファイルのフォルダを取得する。"""
+    if editor is None:
         return None
 
     try:
-        dir_path = normalize_path(dir_path)
-        if is_existing_dir(dir_path):
-            return climb_if_managed_subfolder(dir_path)
+        path = editor.get_path()
+        if path:
+            return _climb_if_managed_subfolder(os.path.dirname(normalize_path(path)))
     except Exception:
         pass
 
     return None
 
 
-# =====================================
-# アプリ基準フォルダの決定
-# =====================================
-def resolve_script_folder():
-    """
-    このアプリの基準フォルダを安全寄りに取得する。
+def _module_folder():
+    """app_storage.py 自身のフォルダを取得する。"""
+    try:
+        return _climb_if_managed_subfolder(os.path.dirname(normalize_path(__file__)))
+    except Exception:
+        return None
+
+
+def _cwd_folder():
+    """現在の作業フォルダを取得する。"""
+    try:
+        return _climb_if_managed_subfolder(os.getcwd())
+    except Exception:
+        return None
+
+
+def _documents_folder():
+    """最後の保険として Pythonista の Documents フォルダ相当を返す。"""
+    return normalize_path('~/Documents')
+
+
+def initialize_app_folder(force=False):
+    """アプリの基準フォルダを確定する。
 
     優先順位:
-      1. __file__
-      2. editor.get_path()
-      3. cwd
-      4. Documents
+        1. 呼び出し元 app.py のフォルダ
+        2. Pythonista editor で開いているファイルのフォルダ
+        3. app_storage.py 自身のフォルダ
+        4. os.getcwd()
+        5. ~/Documents
 
-    さらに、
-      - data/export/backup を指した場合は親へ戻す
-      - app.py がある場所を優先する
-    """
-    candidates = []
-
-    # 1. __file__
-    try:
-        file_path = os.path.abspath(__file__)
-        candidate = make_candidate_from_file(file_path)
-        if candidate:
-            candidates.append(candidate)
-    except Exception:
-        pass
-
-    # 2. editor.get_path()
-    if editor is not None:
-        try:
-            editor_path = editor.get_path()
-            candidate = make_candidate_from_file(editor_path)
-            if candidate:
-                candidates.append(candidate)
-        except Exception:
-            pass
-
-    # 3. cwd
-    try:
-        cwd = os.getcwd()
-        candidate = make_candidate_from_dir(cwd)
-        if candidate:
-            candidates.append(candidate)
-    except Exception:
-        pass
-
-    # app.py がある候補を優先
-    for candidate in candidates:
-        if path_contains_app_py(candidate):
-            return candidate
-
-    # それ以外は最初の使える候補
-    for candidate in candidates:
-        if is_existing_dir(candidate):
-            return candidate
-
-    # 最後の保険
-    return os.path.expanduser('~/Documents')
-
-
-def initialize_app_folder():
-    """
-    起動時に1回だけアプリ基準フォルダを確定してキャッシュする。
+    一度決めたフォルダはキャッシュします。
     """
     global _APP_FOLDER_CACHE
 
-    folder = resolve_script_folder()
-    folder = normalize_path(folder)
-    folder = climb_if_managed_subfolder(folder)
+    if _APP_FOLDER_CACHE and not force:
+        return _APP_FOLDER_CACHE
 
-    _APP_FOLDER_CACHE = folder
+    candidates = [
+        _caller_app_folder(),
+        _editor_folder(),
+        _module_folder(),
+        _cwd_folder(),
+        _documents_folder(),
+    ]
+
+    # app.py があるフォルダを最優先にする。
+    for folder in candidates:
+        if folder and _path_contains_app_py(folder):
+            _APP_FOLDER_CACHE = normalize_path(folder)
+            ensure_storage_dirs()
+            return _APP_FOLDER_CACHE
+
+    # app.py が見つからない場合は、最初に有効だったフォルダを使う。
+    for folder in candidates:
+        if folder:
+            _APP_FOLDER_CACHE = normalize_path(folder)
+            ensure_storage_dirs()
+            return _APP_FOLDER_CACHE
+
+    _APP_FOLDER_CACHE = _documents_folder()
+    ensure_storage_dirs()
     return _APP_FOLDER_CACHE
+
+
+def stabilize_startup(wait=0.2):
+    """Pythonista起動直後のパス揺れを避けるため、少し待ってから保存先を確定する。"""
+    try:
+        if wait and wait > 0:
+            time.sleep(wait)
+    except Exception:
+        pass
+
+    return initialize_app_folder(force=True)
 
 
 def app_folder_path():
-    """
-    アプリ全体の基準フォルダ。
-    起動後はキャッシュを返すのでブレにくい。
-    """
-    global _APP_FOLDER_CACHE
-
-    if _APP_FOLDER_CACHE is None:
-        return initialize_app_folder()
-
-    return _APP_FOLDER_CACHE
-
-
-# =====================================
-# サブフォルダ
-# =====================================
-def ensure_subfolder(name):
-    path = os.path.join(app_folder_path(), name)
-    path = normalize_path(path)
-    os.makedirs(path, exist_ok=True)
-    return path
+    return initialize_app_folder()
 
 
 def data_folder_path():
-    return ensure_subfolder(DATA_DIR_NAME)
+    return os.path.join(app_folder_path(), DATA_DIR_NAME)
 
 
 def export_folder_path():
-    return ensure_subfolder(EXPORT_DIR_NAME)
+    return os.path.join(app_folder_path(), EXPORT_DIR_NAME)
 
 
 def backup_folder_path():
-    return ensure_subfolder(BACKUP_DIR_NAME)
+    return os.path.join(app_folder_path(), BACKUP_DIR_NAME)
 
 
-def data_file_path(file_name):
-    return normalize_path(os.path.join(data_folder_path(), file_name))
+def ensure_dir(path):
+    path = normalize_path(path)
+    if not os.path.isdir(path):
+        os.makedirs(path)
+    return path
 
 
-def export_file_path(file_name):
-    return normalize_path(os.path.join(export_folder_path(), file_name))
+def ensure_storage_dirs():
+    """data / export / backup フォルダを作成する。"""
+    base = _APP_FOLDER_CACHE or _documents_folder()
+    for name in (DATA_DIR_NAME, EXPORT_DIR_NAME, BACKUP_DIR_NAME):
+        try:
+            ensure_dir(os.path.join(base, name))
+        except Exception:
+            pass
 
 
-def backup_file_path(file_name):
-    return normalize_path(os.path.join(backup_folder_path(), file_name))
-
-
-# =====================================
-# 安全確認
-# =====================================
-def is_path_inside_base(target_path, base_path):
-    target_path = normalize_path(target_path)
-    base_path = normalize_path(base_path)
-
+def is_path_inside_base(path, base):
+    """path が base の内側にあるかを確認する。"""
     try:
-        common = os.path.commonpath([target_path, base_path])
-        return common == base_path
+        path = normalize_path(path)
+        base = normalize_path(base)
+        common = os.path.commonpath([path, base])
+        return common == base
     except Exception:
         return False
 
 
 def assert_safe_storage_path(path):
-    """
-    保存先が app_folder 配下にあることを確認する。
-    """
+    """アプリ基準フォルダの外へ誤保存しないための安全確認。"""
     base = app_folder_path()
-
     if not is_path_inside_base(path, base):
-        raise RuntimeError(
-            "保存先が想定外です。\n"
-            f"path: {path}\n"
-            f"app_folder: {base}"
-        )
+        raise ValueError('保存先がアプリフォルダ外です: {}'.format(path))
 
 
-# =====================================
-# 起動安定化
-# =====================================
-def stabilize_startup(wait_seconds=STARTUP_WAIT_SECONDS):
-    """
-    起動直後の揺れを避けつつ、基準フォルダを先に確定する。
-    """
-    try:
-        time.sleep(wait_seconds)
-    except Exception:
-        pass
-
-    initialize_app_folder()
-    ensure_subfolder(DATA_DIR_NAME)
-    ensure_subfolder(EXPORT_DIR_NAME)
-    ensure_subfolder(BACKUP_DIR_NAME)
+def data_file_path(filename):
+    path = os.path.join(data_folder_path(), filename)
+    assert_safe_storage_path(path)
+    ensure_dir(os.path.dirname(path))
+    return path
 
 
-# =====================================
+def export_file_path(filename):
+    path = os.path.join(export_folder_path(), filename)
+    assert_safe_storage_path(path)
+    ensure_dir(os.path.dirname(path))
+    return path
+
+
+def backup_file_path(filename):
+    path = os.path.join(backup_folder_path(), filename)
+    assert_safe_storage_path(path)
+    ensure_dir(os.path.dirname(path))
+    return path
+
+
+# =============================
 # JSON
-# =====================================
-def load_json(file_name, default=None,
-              retry_count=RETRY_COUNT,
-              wait_seconds=RETRY_WAIT_SECONDS):
-    path = data_file_path(file_name)
+# =============================
+def load_json(filename, default=None, retry=2, wait=0.1):
+    """dataフォルダからJSONを読み込む。
 
-    for _ in range(retry_count):
+    読み込みに失敗した場合は default を返します。
+    iCloud同期直後などの一時的な読み込み失敗に備えて、軽くリトライします。
+    """
+    path = data_file_path(filename)
+
+    if not os.path.exists(path):
+        return default
+
+    last_error = None
+    for attempt in range(retry + 1):
         try:
-            if not os.path.exists(path):
-                return default
-
             with open(path, 'r', encoding='utf-8') as f:
                 return json.load(f)
+        except Exception as e:
+            last_error = e
+            try:
+                time.sleep(wait)
+            except Exception:
+                pass
 
-        except FileNotFoundError:
-            return default
-
-        except json.JSONDecodeError:
-            return default
-
-        except OSError:
-            time.sleep(wait_seconds)
-
-        except Exception:
-            time.sleep(wait_seconds)
-
+    print('load_json error:', filename, last_error)
     return default
 
 
-def save_json(file_name, data):
-    path = data_file_path(file_name)
+def _atomic_write_text(path, text):
+    """一時ファイルへ書いてから置き換える簡易的な安全保存。"""
+    path = normalize_path(path)
     assert_safe_storage_path(path)
+    ensure_dir(os.path.dirname(path))
 
-    with open(path, 'w', encoding='utf-8') as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+    tmp_path = path + '.tmp'
 
-    return path
-
-
-def backup_file_prefix(file_name):
-    """
-    バックアップファイル名の接頭辞を返す。
-
-    例:
-      golf_data.json -> golf_data_
-      golf_courses.json -> golf_courses_
-    """
-    name, _ext = os.path.splitext(file_name)
-    return name + '_'
-
-
-def list_backup_files_for(file_name):
-    """
-    指定されたJSONファイルに対応するバックアップファイル一覧を返す。
-
-    例:
-      file_name = 'golf_data.json'
-      対象:
-        backup/golf_data_20260523_143012.json
-        backup/golf_data_20260523_143245.json
-    """
-    folder = backup_folder_path()
-    prefix = backup_file_prefix(file_name)
-    _name, ext = os.path.splitext(file_name)
-
-    items = []
+    with open(tmp_path, 'w', encoding='utf-8') as f:
+        f.write(text)
 
     try:
-        for fname in os.listdir(folder):
-            if not fname.startswith(prefix):
-                continue
-            if ext and not fname.endswith(ext):
-                continue
-
-            path = os.path.join(folder, fname)
-            path = normalize_path(path)
-
-            if not is_existing_file(path):
-                continue
-
-            try:
-                mtime = os.path.getmtime(path)
-            except Exception:
-                mtime = 0
-
-            items.append({
-                'name': fname,
-                'path': path,
-                'mtime': mtime,
-            })
+        os.replace(tmp_path, path)
     except Exception:
-        return []
-
-    # 新しいものが先
-    items.sort(key=lambda x: (x.get('mtime', 0), x.get('name', '')), reverse=True)
-    return items
-
-
-def cleanup_backups_for(file_name, keep_count=BACKUP_KEEP_COUNT):
-    """
-    指定されたJSONファイルのバックアップを最新 keep_count 個だけ残す。
-
-    注意:
-    - 現在の正式データ data/*.json は削除しません。
-    - backup フォルダ内の古いバックアップだけを削除します。
-    """
-    if keep_count is None:
-        return []
-
-    try:
-        keep_count = int(keep_count)
-    except Exception:
-        keep_count = BACKUP_KEEP_COUNT
-
-    if keep_count < 0:
-        keep_count = 0
-
-    items = list_backup_files_for(file_name)
-
-    # 残す件数以内なら何もしない
-    if len(items) <= keep_count:
-        return []
-
-    delete_items = items[keep_count:]
-    deleted = []
-
-    for item in delete_items:
-        path = item.get('path')
+        # Pythonista/iCloud環境で os.replace がうまくいかない場合の保険。
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write(text)
         try:
-            assert_safe_storage_path(path)
-            os.remove(path)
-            deleted.append(path)
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
         except Exception:
-            # バックアップ整理失敗でアプリ本体を止めたくないため、
-            # ここでは例外を外に出しません。
             pass
 
-    return deleted
 
-
-def cleanup_all_backups(keep_count=BACKUP_KEEP_COUNT):
-    """
-    backup フォルダ内の代表的なJSONバックアップを整理する補助関数。
-
-    通常のアプリ動作では save_json_with_backup() が個別に整理するため、
-    この関数を直接呼ぶ必要はありません。
-
-    既に大量にたまったバックアップを一括整理したい場合に使えます。
-    """
-    target_files = [
-        'golf_data.json',
-        'golf_courses.json',
-        'golf_active_round_id.json',
-    ]
-
-    deleted = []
-    for file_name in target_files:
-        deleted.extend(cleanup_backups_for(file_name, keep_count=keep_count))
-
-    return deleted
-
-
-def backup_json(file_name, data):
-    """
-    現在のJSON内容を backup フォルダに保存する。
-
-    ファイル名例:
-      golf_data_20260523_143012.json
-    """
-    timestamp = time.strftime('%Y%m%d_%H%M%S')
-    name, ext = os.path.splitext(file_name)
-    backup_name = f'{name}_{timestamp}{ext}'
-    path = backup_file_path(backup_name)
-    assert_safe_storage_path(path)
-
-    with open(path, 'w', encoding='utf-8') as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-
+def save_json(filename, data):
+    """dataフォルダへJSONを保存する。バックアップは作らない。"""
+    path = data_file_path(filename)
+    text = json.dumps(data, ensure_ascii=False, indent=2)
+    _atomic_write_text(path, text)
     return path
 
 
-def save_json_with_backup(file_name, data):
-    """
-    JSONを保存する前に、現在の古いデータを backup に残す。
+def backup_json(filename):
+    """既存のJSONファイルを backup フォルダへコピーする。"""
+    src_path = data_file_path(filename)
+    if not os.path.exists(src_path):
+        return None
 
-    今回の改良:
-    - バックアップ作成後、同じ種類のバックアップを最新件数だけ残す。
-    - これにより backup フォルダが増え続けるのを防ぎます。
-    """
-    old_data = load_json(file_name, default=None)
-    if old_data is not None:
-        backup_json(file_name, old_data)
-        cleanup_backups_for(file_name, keep_count=BACKUP_KEEP_COUNT)
+    root, ext = os.path.splitext(filename)
+    if not ext:
+        ext = '.json'
 
-    return save_json(file_name, data)
+    timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+    backup_name = '{}_{}{}'.format(root, timestamp, ext)
+    dst_path = backup_file_path(backup_name)
+
+    try:
+        shutil.copy2(src_path, dst_path)
+        return dst_path
+    except Exception as e:
+        print('backup_json error:', filename, e)
+        return None
 
 
-# =====================================
+def save_json_with_backup(filename, data):
+    """既存JSONをバックアップしてから保存する。"""
+    try:
+        backup_json(filename)
+    except Exception as e:
+        print('backup before save error:', filename, e)
+
+    return save_json(filename, data)
+
+
+# =============================
 # CSV
-# =====================================
-def save_csv(file_name, rows, fieldnames=None):
-    path = export_file_path(file_name)
-    assert_safe_storage_path(path)
+# =============================
+def save_csv(filename, rows, fieldnames=None, encoding='utf-8-sig'):
+    """exportフォルダへCSVを保存する。
+
+    fieldnames を指定すると、列順を固定できます。
+    rows に存在しない列は空欄になり、余分な列は無視します。
+    """
+    path = export_file_path(filename)
 
     if rows is None:
         rows = []
 
-    with open(path, 'w', newline='', encoding='utf-8-sig') as f:
-        if not rows:
-            if fieldnames:
-                writer = csv.DictWriter(f, fieldnames=fieldnames)
-                writer.writeheader()
-            return path
+    rows = list(rows)
 
-        first_row = rows[0]
+    if fieldnames is None:
+        fieldnames = []
+        for row in rows:
+            if isinstance(row, dict):
+                for key in row.keys():
+                    if key not in fieldnames:
+                        fieldnames.append(key)
 
-        if isinstance(first_row, dict):
-            if fieldnames is None:
-                fieldnames = list(first_row.keys())
+    with open(path, 'w', newline='', encoding=encoding) as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=fieldnames,
+            extrasaction='ignore'
+        )
+        writer.writeheader()
 
-            writer = csv.DictWriter(f, fieldnames=fieldnames)
-            writer.writeheader()
-            writer.writerows(rows)
-        else:
-            writer = csv.writer(f)
-            writer.writerows(rows)
+        for row in rows:
+            if isinstance(row, dict):
+                writer.writerow(row)
 
     return path
 
 
-def append_csv(file_name, row, fieldnames=None):
-    path = export_file_path(file_name)
-    assert_safe_storage_path(path)
+def append_csv(filename, row, fieldnames=None, encoding='utf-8-sig'):
+    """exportフォルダのCSVへ1行追加する。なければヘッダーも作る。"""
+    path = export_file_path(filename)
+
+    if fieldnames is None:
+        if isinstance(row, dict):
+            fieldnames = list(row.keys())
+        else:
+            fieldnames = []
 
     file_exists = os.path.exists(path)
+    needs_header = not file_exists or os.path.getsize(path) == 0
 
-    with open(path, 'a', newline='', encoding='utf-8-sig') as f:
+    with open(path, 'a', newline='', encoding=encoding) as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=fieldnames,
+            extrasaction='ignore'
+        )
+        if needs_header:
+            writer.writeheader()
         if isinstance(row, dict):
-            if fieldnames is None:
-                fieldnames = list(row.keys())
-
-            writer = csv.DictWriter(f, fieldnames=fieldnames)
-
-            if not file_exists or os.path.getsize(path) == 0:
-                writer.writeheader()
-
-            writer.writerow(row)
-        else:
-            writer = csv.writer(f)
             writer.writerow(row)
 
     return path
 
 
-# =====================================
-# 表示用補助
-# =====================================
-def storage_info_text(file_name=None):
-    lines = []
-    lines.append('app_folder: ' + app_folder_path())
-    lines.append('data_folder: ' + data_folder_path())
-    lines.append('export_folder: ' + export_folder_path())
-    lines.append('backup_folder: ' + backup_folder_path())
+# =============================
+# 表示用
+# =============================
+def app_folder_display_text():
+    """画面下部などに出す短い保存先表示。"""
+    return '保存先: {}'.format(app_folder_path())
 
-    if file_name:
-        lines.append('data_file: ' + data_file_path(file_name))
-        lines.append('export_file: ' + export_file_path(file_name))
+
+def storage_info_text():
+    """デバッグ用に保存先情報をまとめて返す。"""
+    lines = [
+        'app: {}'.format(app_folder_path()),
+        'data: {}'.format(data_folder_path()),
+        'export: {}'.format(export_folder_path()),
+        'backup: {}'.format(backup_folder_path()),
+    ]
+
+    try:
+        data_files = os.listdir(data_folder_path())
+        lines.append('data files: {}'.format(', '.join(data_files) if data_files else 'なし'))
+    except Exception:
+        pass
+
+    try:
+        export_files = os.listdir(export_folder_path())
+        lines.append('export files: {}'.format(', '.join(export_files) if export_files else 'なし'))
+    except Exception:
+        pass
 
     return '\n'.join(lines)
-
-
-def app_folder_display_text():
-    return '保存先: ' + app_folder_path()
